@@ -20,10 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,20 +39,61 @@ import (
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/retrieval"
+	"github.com/prometheus/prometheus/scrape"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/remote"
 )
 
-type targetRetrieverFunc func() []*retrieval.Target
+type testTargetRetriever struct{}
 
-func (f targetRetrieverFunc) Targets() []*retrieval.Target {
-	return f()
+func (t testTargetRetriever) TargetsActive() []*scrape.Target {
+	return []*scrape.Target{
+		scrape.NewTarget(
+			labels.FromMap(map[string]string{
+				model.SchemeLabel:      "http",
+				model.AddressLabel:     "example.com:8080",
+				model.MetricsPathLabel: "/metrics",
+			}),
+			nil,
+			url.Values{},
+		),
+	}
+}
+func (t testTargetRetriever) TargetsDropped() []*scrape.Target {
+	return []*scrape.Target{
+		scrape.NewTarget(
+			nil,
+			labels.FromMap(map[string]string{
+				model.AddressLabel:     "http://dropped.example.com:9115",
+				model.MetricsPathLabel: "/probe",
+				model.SchemeLabel:      "http",
+				model.JobLabel:         "blackbox",
+			}),
+			url.Values{},
+		),
+	}
 }
 
-type alertmanagerRetrieverFunc func() []*url.URL
+type testAlertmanagerRetriever struct{}
 
-func (f alertmanagerRetrieverFunc) Alertmanagers() []*url.URL {
-	return f()
+func (t testAlertmanagerRetriever) Alertmanagers() []*url.URL {
+	return []*url.URL{
+		{
+			Scheme: "http",
+			Host:   "alertmanager.example.com:8080",
+			Path:   "/api/v1/alerts",
+		},
+	}
+}
+
+func (t testAlertmanagerRetriever) DroppedAlertmanagers() []*url.URL {
+	return []*url.URL{
+		{
+			Scheme: "http",
+			Host:   "dropped.alertmanager.example.com:8080",
+			Path:   "/api/v1/alerts",
+		},
+	}
 }
 
 var samplePrometheusCfg = config.Config{
@@ -60,6 +103,11 @@ var samplePrometheusCfg = config.Config{
 	ScrapeConfigs:      []*config.ScrapeConfig{},
 	RemoteWriteConfigs: []*config.RemoteWriteConfig{},
 	RemoteReadConfigs:  []*config.RemoteReadConfig{},
+}
+
+var sampleFlagMap = map[string]string{
+	"flag1": "value1",
+	"flag2": "value2",
 }
 
 func TestEndpoints(t *testing.T) {
@@ -80,36 +128,19 @@ func TestEndpoints(t *testing.T) {
 
 	now := time.Now()
 
-	tr := targetRetrieverFunc(func() []*retrieval.Target {
-		return []*retrieval.Target{
-			retrieval.NewTarget(
-				labels.FromMap(map[string]string{
-					model.SchemeLabel:      "http",
-					model.AddressLabel:     "example.com:8080",
-					model.MetricsPathLabel: "/metrics",
-				}),
-				nil,
-				url.Values{},
-			),
-		}
-	})
+	var tr testTargetRetriever
 
-	ar := alertmanagerRetrieverFunc(func() []*url.URL {
-		return []*url.URL{{
-			Scheme: "http",
-			Host:   "alertmanager.example.com:8080",
-			Path:   "/api/v1/alerts",
-		}}
-	})
+	var ar testAlertmanagerRetriever
 
 	api := &API{
 		Queryable:             suite.Storage(),
 		QueryEngine:           suite.QueryEngine(),
 		targetRetriever:       tr,
 		alertmanagerRetriever: ar,
-		now:    func() time.Time { return now },
-		config: func() config.Config { return samplePrometheusCfg },
-		ready:  func(f http.HandlerFunc) http.HandlerFunc { return f },
+		now:      func() time.Time { return now },
+		config:   func() config.Config { return samplePrometheusCfg },
+		flagsMap: sampleFlagMap,
+		ready:    func(f http.HandlerFunc) http.HandlerFunc { return f },
 	}
 
 	start := time.Unix(0, 0)
@@ -430,6 +461,16 @@ func TestEndpoints(t *testing.T) {
 						Health:           "unknown",
 					},
 				},
+				DroppedTargets: []*DroppedTarget{
+					{
+						DiscoveredLabels: map[string]string{
+							"__address__":      "http://dropped.example.com:9115",
+							"__metrics_path__": "/probe",
+							"__scheme__":       "http",
+							"job":              "blackbox",
+						},
+					},
+				},
 			},
 		},
 		{
@@ -440,6 +481,11 @@ func TestEndpoints(t *testing.T) {
 						URL: "http://alertmanager.example.com:8080/api/v1/alerts",
 					},
 				},
+				DroppedAlertmanagers: []*AlertmanagerTarget{
+					{
+						URL: "http://dropped.alertmanager.example.com:8080/api/v1/alerts",
+					},
+				},
 			},
 		},
 		{
@@ -448,35 +494,58 @@ func TestEndpoints(t *testing.T) {
 				YAML: samplePrometheusCfg.String(),
 			},
 		},
+		{
+			endpoint: api.serveFlags,
+			response: sampleFlagMap,
+		},
+	}
+
+	methods := func(f apiFunc) []string {
+		fp := reflect.ValueOf(f).Pointer()
+		if fp == reflect.ValueOf(api.query).Pointer() || fp == reflect.ValueOf(api.queryRange).Pointer() {
+			return []string{http.MethodGet, http.MethodPost}
+		}
+		return []string{http.MethodGet}
+	}
+
+	request := func(m string, q url.Values) (*http.Request, error) {
+		if m == http.MethodPost {
+			r, err := http.NewRequest(m, "http://example.com", strings.NewReader(q.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			return r, err
+		}
+		return http.NewRequest(m, fmt.Sprintf("http://example.com?%s", q.Encode()), nil)
 	}
 
 	for _, test := range tests {
-		// Build a context with the correct request params.
-		ctx := context.Background()
-		for p, v := range test.params {
-			ctx = route.WithParam(ctx, p, v)
-		}
-		t.Logf("run query %q", test.query.Encode())
+		for _, method := range methods(test.endpoint) {
+			// Build a context with the correct request params.
+			ctx := context.Background()
+			for p, v := range test.params {
+				ctx = route.WithParam(ctx, p, v)
+			}
+			t.Logf("run %s\t%q", method, test.query.Encode())
 
-		req, err := http.NewRequest("ANY", fmt.Sprintf("http://example.com?%s", test.query.Encode()), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp, apiErr := test.endpoint(req.WithContext(ctx))
-		if apiErr != nil {
-			if test.errType == errorNone {
-				t.Fatalf("Unexpected error: %s", apiErr)
+			req, err := request(method, test.query)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if test.errType != apiErr.typ {
-				t.Fatalf("Expected error of type %q but got type %q", test.errType, apiErr.typ)
+			resp, apiErr, _ := test.endpoint(req.WithContext(ctx))
+			if apiErr != nil {
+				if test.errType == errorNone {
+					t.Fatalf("Unexpected error: %s", apiErr)
+				}
+				if test.errType != apiErr.typ {
+					t.Fatalf("Expected error of type %q but got type %q", test.errType, apiErr.typ)
+				}
+				continue
 			}
-			continue
-		}
-		if apiErr == nil && test.errType != errorNone {
-			t.Fatalf("Expected error of type %q but got none", test.errType)
-		}
-		if !reflect.DeepEqual(resp, test.response) {
-			t.Fatalf("Response does not match, expected:\n%+v\ngot:\n%+v", test.response, resp)
+			if apiErr == nil && test.errType != errorNone {
+				t.Fatalf("Expected error of type %q but got none", test.errType)
+			}
+			if !reflect.DeepEqual(resp, test.response) {
+				t.Fatalf("Response does not match, expected:\n%+v\ngot:\n%+v", test.response, resp)
+			}
 		}
 	}
 }
@@ -520,7 +589,7 @@ func TestReadEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	query, err := remote.ToQuery(0, 1, []*labels.Matcher{matcher1, matcher2})
+	query, err := remote.ToQuery(0, 1, []*labels.Matcher{matcher1, matcher2}, &storage.SelectParams{Step: 0, Func: "avg"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -784,5 +853,130 @@ func TestOptionsMethod(t *testing.T) {
 		if resp.Header.Get(h) != v {
 			t.Fatalf("Expected %q for header %q, got %q", v, h, resp.Header.Get(h))
 		}
+	}
+}
+
+func TestRespond(t *testing.T) {
+	cases := []struct {
+		response interface{}
+		expected string
+	}{
+		{
+			response: &queryData{
+				ResultType: promql.ValueTypeMatrix,
+				Result: promql.Matrix{
+					promql.Series{
+						Points: []promql.Point{{V: 1, T: 1000}},
+						Metric: labels.FromStrings("__name__", "foo"),
+					},
+				},
+			},
+			expected: `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"foo"},"values":[[1,"1"]]}]}}`,
+		},
+		{
+			response: promql.Point{V: 0, T: 0},
+			expected: `{"status":"success","data":[0,"0"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 1},
+			expected: `{"status":"success","data":[0.001,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 10},
+			expected: `{"status":"success","data":[0.010,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 100},
+			expected: `{"status":"success","data":[0.100,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 1001},
+			expected: `{"status":"success","data":[1.001,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 1010},
+			expected: `{"status":"success","data":[1.010,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 1100},
+			expected: `{"status":"success","data":[1.100,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: 12345678123456555},
+			expected: `{"status":"success","data":[12345678123456.555,"20"]}`,
+		},
+		{
+			response: promql.Point{V: 20, T: -1},
+			expected: `{"status":"success","data":[-0.001,"20"]}`,
+		},
+		{
+			response: promql.Point{V: math.NaN(), T: 0},
+			expected: `{"status":"success","data":[0,"NaN"]}`,
+		},
+		{
+			response: promql.Point{V: math.Inf(1), T: 0},
+			expected: `{"status":"success","data":[0,"+Inf"]}`,
+		},
+		{
+			response: promql.Point{V: math.Inf(-1), T: 0},
+			expected: `{"status":"success","data":[0,"-Inf"]}`,
+		},
+		{
+			response: promql.Point{V: 1.2345678e6, T: 0},
+			expected: `{"status":"success","data":[0,"1234567.8"]}`,
+		},
+		{
+			response: promql.Point{V: 1.2345678e-6, T: 0},
+			expected: `{"status":"success","data":[0,"0.0000012345678"]}`,
+		},
+		{
+			response: promql.Point{V: 1.2345678e-67, T: 0},
+			expected: `{"status":"success","data":[0,"1.2345678e-67"]}`,
+		},
+	}
+
+	for _, c := range cases {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			respond(w, c.response)
+		}))
+		defer s.Close()
+
+		resp, err := http.Get(s.URL)
+		if err != nil {
+			t.Fatalf("Error on test request: %s", err)
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		defer resp.Body.Close()
+		if err != nil {
+			t.Fatalf("Error reading response body: %s", err)
+		}
+
+		if string(body) != c.expected {
+			t.Fatalf("Expected response \n%v\n but got \n%v\n", c.expected, string(body))
+		}
+	}
+}
+
+// This is a global to avoid the benchmark being optimized away.
+var testResponseWriter = httptest.ResponseRecorder{}
+
+func BenchmarkRespond(b *testing.B) {
+	b.ReportAllocs()
+	points := []promql.Point{}
+	for i := 0; i < 10000; i++ {
+		points = append(points, promql.Point{V: float64(i * 1000000), T: int64(i)})
+	}
+	response := &queryData{
+		ResultType: promql.ValueTypeMatrix,
+		Result: promql.Matrix{
+			promql.Series{
+				Points: points,
+				Metric: nil,
+			},
+		},
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		respond(&testResponseWriter, response)
 	}
 }

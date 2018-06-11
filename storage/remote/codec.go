@@ -15,6 +15,7 @@ package remote
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"sort"
@@ -28,9 +29,12 @@ import (
 	"github.com/prometheus/prometheus/storage"
 )
 
+// decodeReadLimit is the maximum size of a read request body in bytes.
+const decodeReadLimit = 32 * 1024 * 1024
+
 // DecodeReadRequest reads a remote.Request from a http.Request.
 func DecodeReadRequest(r *http.Request) (*prompb.ReadRequest, error) {
-	compressed, err := ioutil.ReadAll(r.Body)
+	compressed, err := ioutil.ReadAll(io.LimitReader(r.Body, decodeReadLimit))
 	if err != nil {
 		return nil, err
 	}
@@ -86,16 +90,22 @@ func ToWriteRequest(samples []*model.Sample) *prompb.WriteRequest {
 }
 
 // ToQuery builds a Query proto.
-func ToQuery(from, to int64, matchers []*labels.Matcher) (*prompb.Query, error) {
+func ToQuery(from, to int64, matchers []*labels.Matcher, p *storage.SelectParams) (*prompb.Query, error) {
 	ms, err := toLabelMatchers(matchers)
 	if err != nil {
 		return nil, err
+	}
+
+	rp := &prompb.ReadHints{
+		StepMs: p.Step,
+		Func:   p.Func,
 	}
 
 	return &prompb.Query{
 		StartTimestampMs: from,
 		EndTimestampMs:   to,
 		Matchers:         ms,
+		Hints:            rp,
 	}, nil
 }
 
@@ -158,6 +168,12 @@ func FromQueryResult(res *prompb.QueryResult) storage.SeriesSet {
 	}
 }
 
+type byLabel []storage.Series
+
+func (a byLabel) Len() int           { return len(a) }
+func (a byLabel) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byLabel) Less(i, j int) bool { return labels.Compare(a[i].Labels(), a[j].Labels()) < 0 }
+
 // errSeriesSet implements storage.SeriesSet, just returning an error.
 type errSeriesSet struct {
 	err error
@@ -194,14 +210,14 @@ func (c *concreteSeriesSet) Err() error {
 	return nil
 }
 
-// concreteSeries implementes storage.Series.
+// concreteSeries implements storage.Series.
 type concreteSeries struct {
 	labels  labels.Labels
 	samples []*prompb.Sample
 }
 
 func (c *concreteSeries) Labels() labels.Labels {
-	return c.labels
+	return labels.New(c.labels...)
 }
 
 func (c *concreteSeries) Iterator() storage.SeriesIterator {

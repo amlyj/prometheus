@@ -17,23 +17,10 @@ import (
 	"testing"
 
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/pkg/apis/extensions/v1beta1"
 )
-
-func ingressStoreKeyFunc(obj interface{}) (string, error) {
-	return obj.(*v1beta1.Ingress).ObjectMeta.Name, nil
-}
-
-func newFakeIngressInformer() *fakeInformer {
-	return newFakeInformer(ingressStoreKeyFunc)
-}
-
-func makeTestIngressDiscovery() (*Ingress, *fakeInformer) {
-	i := newFakeIngressInformer()
-	return NewIngress(nil, i), i
-}
 
 func makeIngress(tls []v1beta1.IngressTLS) *v1beta1.Ingress {
 	return &v1beta1.Ingress{
@@ -77,13 +64,13 @@ func makeIngress(tls []v1beta1.IngressTLS) *v1beta1.Ingress {
 	}
 }
 
-func expectedTargetGroups(tls bool) []*config.TargetGroup {
+func expectedTargetGroups(tls bool) map[string]*targetgroup.Group {
 	scheme := "http"
 	if tls {
 		scheme = "https"
 	}
-	return []*config.TargetGroup{
-		{
+	return map[string]*targetgroup.Group{
+		"ingress/default/testingress": {
 			Targets: []model.LabelSet{
 				{
 					"__meta_kubernetes_ingress_scheme": lv(scheme),
@@ -115,22 +102,32 @@ func expectedTargetGroups(tls bool) []*config.TargetGroup {
 	}
 }
 
-func TestIngressDiscoveryInitial(t *testing.T) {
-	n, i := makeTestIngressDiscovery()
-	i.GetStore().Add(makeIngress(nil))
+func TestIngressDiscoveryAdd(t *testing.T) {
+	n, c, w := makeDiscovery(RoleIngress, NamespaceDiscovery{Names: []string{"default"}})
 
 	k8sDiscoveryTest{
-		discovery:       n,
-		expectedInitial: expectedTargetGroups(false),
+		discovery: n,
+		afterStart: func() {
+			obj := makeIngress(nil)
+			c.ExtensionsV1beta1().Ingresses("default").Create(obj)
+			w.Ingresses().Add(obj)
+		},
+		expectedMaxItems: 1,
+		expectedRes:      expectedTargetGroups(false),
 	}.Run(t)
 }
 
-func TestIngressDiscoveryInitialTLS(t *testing.T) {
-	n, i := makeTestIngressDiscovery()
-	i.GetStore().Add(makeIngress([]v1beta1.IngressTLS{{}}))
+func TestIngressDiscoveryAddTLS(t *testing.T) {
+	n, c, w := makeDiscovery(RoleIngress, NamespaceDiscovery{Names: []string{"default"}})
 
 	k8sDiscoveryTest{
-		discovery:       n,
-		expectedInitial: expectedTargetGroups(true),
+		discovery: n,
+		afterStart: func() {
+			obj := makeIngress([]v1beta1.IngressTLS{{}})
+			c.ExtensionsV1beta1().Ingresses("default").Create(obj)
+			w.Ingresses().Add(obj)
+		},
+		expectedMaxItems: 1,
+		expectedRes:      expectedTargetGroups(true),
 	}.Run(t)
 }

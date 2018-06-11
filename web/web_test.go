@@ -30,6 +30,11 @@ import (
 	libtsdb "github.com/prometheus/tsdb"
 )
 
+func TestMain(m *testing.M) {
+	// On linux with a global proxy the tests will fail as the go client(http,grpc) tries to connect through the proxy.
+	os.Setenv("no_proxy", "localhost,127.0.0.1,0.0.0.0,:")
+	os.Exit(m.Run())
+}
 func TestGlobalURL(t *testing.T) {
 	opts := &Options{
 		ListenAddress: ":9090",
@@ -78,6 +83,54 @@ func TestGlobalURL(t *testing.T) {
 	}
 }
 
+func TestEndpointHeaders(t *testing.T) {
+	t.Parallel()
+	dbDir, err := ioutil.TempDir("", "tsdb-ready")
+
+	testutil.Ok(t, err)
+
+	defer os.RemoveAll(dbDir)
+
+	db, err := libtsdb.Open(dbDir, nil, nil, nil)
+
+	testutil.Ok(t, err)
+
+	opts := &Options{
+		ListenAddress:  ":9095",
+		ReadTimeout:    30 * time.Second,
+		MaxConnections: 512,
+		Context:        nil,
+		Storage:        &tsdb.ReadyStorage{},
+		QueryEngine:    nil,
+		RuleManager:    nil,
+		Notifier:       nil,
+		RoutePrefix:    "/",
+		EnableAdminAPI: true,
+		TSDB:           func() *libtsdb.DB { return db },
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+	go func() {
+		err := webHandler.Run(context.Background())
+		if err != nil {
+			panic(fmt.Sprintf("Can't start webhandler error %s", err))
+		}
+	}()
+
+	time.Sleep(5 * time.Second)
+
+	resp, err := http.Get("http://localhost:9095/version")
+
+	testutil.Ok(t, err)
+	testutil.Equals(t, "1; mode=block", resp.Header.Get("X-XSS-Protection"))
+	testutil.Equals(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	testutil.Equals(t, "SAMEORIGIN", resp.Header.Get("X-Frame-Options"))
+	testutil.Equals(t, "frame-ancestors 'self'", resp.Header.Get("Content-Security-Policy"))
+
+}
+
 func TestReadyAndHealthy(t *testing.T) {
 	t.Parallel()
 	dbDir, err := ioutil.TempDir("", "tsdb-ready")
@@ -96,11 +149,10 @@ func TestReadyAndHealthy(t *testing.T) {
 		Context:        nil,
 		Storage:        &tsdb.ReadyStorage{},
 		QueryEngine:    nil,
-		TargetManager:  nil,
+		ScrapeManager:  nil,
 		RuleManager:    nil,
 		Notifier:       nil,
 		RoutePrefix:    "/",
-		MetricsPath:    "/metrics/",
 		EnableAdminAPI: true,
 		TSDB:           func() *libtsdb.DB { return db },
 	}
@@ -108,7 +160,12 @@ func TestReadyAndHealthy(t *testing.T) {
 	opts.Flags = map[string]string{}
 
 	webHandler := New(nil, opts)
-	go webHandler.Run(context.Background())
+	go func() {
+		err := webHandler.Run(context.Background())
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
 
 	// Give some time for the web goroutine to run since we need the server
 	// to be up before starting tests.
@@ -187,11 +244,10 @@ func TestRoutePrefix(t *testing.T) {
 		Context:        nil,
 		Storage:        &tsdb.ReadyStorage{},
 		QueryEngine:    nil,
-		TargetManager:  nil,
+		ScrapeManager:  nil,
 		RuleManager:    nil,
 		Notifier:       nil,
 		RoutePrefix:    "/prometheus",
-		MetricsPath:    "/prometheus/metrics",
 		EnableAdminAPI: true,
 		TSDB:           func() *libtsdb.DB { return db },
 	}
@@ -202,7 +258,7 @@ func TestRoutePrefix(t *testing.T) {
 	go func() {
 		err := webHandler.Run(context.Background())
 		if err != nil {
-			panic(fmt.Sprintf("Can't start webhandler error %s", err))
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
 		}
 	}()
 
@@ -264,6 +320,41 @@ func TestRoutePrefix(t *testing.T) {
 	testutil.Equals(t, http.StatusOK, resp.StatusCode)
 }
 
+func TestPathPrefix(t *testing.T) {
+
+	tests := []struct {
+		routePrefix string
+		pathPrefix  string
+	}{
+		{
+			routePrefix: "/",
+			// If we have pathPrefix as "/", URL in UI gets "//"" as prefix,
+			// hence doesn't remain relative path anymore.
+			pathPrefix: "",
+		},
+		{
+			routePrefix: "/prometheus",
+			pathPrefix:  "/prometheus",
+		},
+		{
+			routePrefix: "/p1/p2/p3/p4",
+			pathPrefix:  "/p1/p2/p3/p4",
+		},
+	}
+
+	for _, test := range tests {
+		opts := &Options{
+			RoutePrefix: test.routePrefix,
+		}
+
+		pathPrefix := tmplFuncs("", opts)["pathPrefix"].(func() string)
+		pp := pathPrefix()
+
+		testutil.Equals(t, test.pathPrefix, pp)
+	}
+
+}
+
 func TestDebugHandler(t *testing.T) {
 	for _, tc := range []struct {
 		prefix, url string
@@ -280,7 +371,6 @@ func TestDebugHandler(t *testing.T) {
 	} {
 		opts := &Options{
 			RoutePrefix: tc.prefix,
-			MetricsPath: "/metrics",
 		}
 		handler := New(nil, opts)
 		handler.Ready()

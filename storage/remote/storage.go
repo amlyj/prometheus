@@ -14,11 +14,15 @@
 package remote
 
 import (
+	"context"
 	"sync"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/storage"
 )
 
 // Callback func that return the oldest timestamp stored in a storage.
@@ -34,17 +38,21 @@ type Storage struct {
 	queues []*QueueManager
 
 	// For reads
-	clients                []*Client
+	queryables             []storage.Queryable
 	localStartTimeCallback startTimeCallback
-	externalLabels         model.LabelSet
+	flushDeadline          time.Duration
 }
 
 // NewStorage returns a remote.Storage.
-func NewStorage(l log.Logger, stCallback startTimeCallback) *Storage {
+func NewStorage(l log.Logger, stCallback startTimeCallback, flushDeadline time.Duration) *Storage {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
-	return &Storage{logger: l, localStartTimeCallback: stCallback}
+	return &Storage{
+		logger:                 l,
+		localStartTimeCallback: stCallback,
+		flushDeadline:          flushDeadline,
+	}
 }
 
 // ApplyConfig updates the state as the new config requires.
@@ -68,10 +76,11 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 		}
 		newQueues = append(newQueues, NewQueueManager(
 			s.logger,
-			config.DefaultQueueConfig,
+			rwConf.QueueConfig,
 			conf.GlobalConfig.ExternalLabels,
 			rwConf.WriteRelabelConfigs,
 			c,
+			s.flushDeadline,
 		))
 	}
 
@@ -86,22 +95,27 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 
 	// Update read clients
 
-	clients := []*Client{}
+	s.queryables = make([]storage.Queryable, 0, len(conf.RemoteReadConfigs))
 	for i, rrConf := range conf.RemoteReadConfigs {
 		c, err := NewClient(i, &ClientConfig{
 			URL:              rrConf.URL,
 			Timeout:          rrConf.RemoteTimeout,
 			HTTPClientConfig: rrConf.HTTPClientConfig,
-			ReadRecent:       rrConf.ReadRecent,
 		})
 		if err != nil {
 			return err
 		}
-		clients = append(clients, c)
-	}
 
-	s.clients = clients
-	s.externalLabels = conf.GlobalConfig.ExternalLabels
+		q := QueryableClient(c)
+		q = ExternablLabelsHandler(q, conf.GlobalConfig.ExternalLabels)
+		if len(rrConf.RequiredMatchers) > 0 {
+			q = RequiredMatchersFilter(q, labelsToEqualityMatchers(rrConf.RequiredMatchers))
+		}
+		if !rrConf.ReadRecent {
+			q = PreferLocalStorageFilter(q, s.localStartTimeCallback)
+		}
+		s.queryables = append(s.queryables, q)
+	}
 
 	return nil
 }
@@ -109,6 +123,24 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 // StartTime implements the Storage interface.
 func (s *Storage) StartTime() (int64, error) {
 	return int64(model.Latest), nil
+}
+
+// Querier returns a storage.MergeQuerier combining the remote client queriers
+// of each configured remote read endpoint.
+func (s *Storage) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+	s.mtx.Lock()
+	queryables := s.queryables
+	s.mtx.Unlock()
+
+	queriers := make([]storage.Querier, 0, len(queryables))
+	for _, queryable := range queryables {
+		q, err := queryable.Querier(ctx, mint, maxt)
+		if err != nil {
+			return nil, err
+		}
+		queriers = append(queriers, q)
+	}
+	return storage.NewMergeQuerier(queriers), nil
 }
 
 // Close the background processing of the storage queues.
@@ -121,4 +153,16 @@ func (s *Storage) Close() error {
 	}
 
 	return nil
+}
+
+func labelsToEqualityMatchers(ls model.LabelSet) []*labels.Matcher {
+	ms := make([]*labels.Matcher, 0, len(ls))
+	for k, v := range ls {
+		ms = append(ms, &labels.Matcher{
+			Type:  labels.MatchEqual,
+			Name:  string(k),
+			Value: string(v),
+		})
+	}
+	return ms
 }
